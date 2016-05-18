@@ -1,8 +1,13 @@
+//#include <Dhcp.h>
+//#include <Dns.h>
+#include <Ethernet.h>
+#include <EthernetUdp.h>
+//#include <EEPROM.h>
+#include <RTClib.h>
 #include <UTFT.h>
 #include <UTouch.h>
 #include <UTFT_Buttons.h>
 #include <NewPing.h>
-#include <LiquidCrystal_I2C.h>
 #include <SPI.h>
 #include <Wire.h>
 #include <OneWire.h>
@@ -10,31 +15,60 @@
 #include <Timer.h>
 
 // SET IS_DEBUG_BUILD to 0 TO REMOVE ALL SERIAL AND DEBUG FUNCTIONALITY
-
 #define IS_DEBUG_BUILD  1
 #if IS_DEBUG_BUILD == 1
   #define DEBUG_BUILD
 #endif
 
 // Arduino Pin definitions
+#define TOUCH_SENSOR_PIN     6
 #define HEATER_RELAY_PIN      7
 #define ATO_RELAY_PIN         8
 #define FEEDMODE_RELAY_PIN    9
+//#define SKIMMER_RELAY_PIN     9
+//#define PUMP_RELAY_PIN        9
+//#define LIGHT_RELAY_PIN       9
 #define ECHO_PIN             10
 #define TRIGGER_PIN          11
 #define ONE_WIRE_PIN         12
-#define TOUCH_SENSOR_PIN     53
 #define MAX_DISTANCE        200
 #define imagedatatype  unsigned int
+
+// DECLARE ALL OBJECTS
+Timer t;
+OneWire ds(ONE_WIRE_PIN);
+NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE); // NewPing setup of pins and maximum distance.
+UTFT myGLCD(SSD1289, 38, 39, 40, 41);
+UTouch  myTouch(6,5,4,3,2);
+UTFT_Buttons  myButtons(&myGLCD, &myTouch);
+
+EthernetUDP Udp;
+RTC_DS1307 rtc;
+DateTime RTCnow;
+
+// SETUP ETHERNET
+// Enter a MAC address for your controller below.
+// Newer Ethernet shields have a MAC address printed on a sticker on the shield
+byte mac[] = {0xDE, 0xAD, 0xBE, 0xEF, 0xFE, 0xED};
+unsigned int localPort = 8888;       // local port to listen for UDP packets
+char timeServer[] = "time.nist.gov"; // time.nist.gov NTP server
+const int NTP_PACKET_SIZE = 48; // NTP time stamp is in the first 48 bytes of the message
+byte packetBuffer[ NTP_PACKET_SIZE]; //buffer to hold incoming and outgoing packets
+
+// TEXT CONSTS
+const String sON = "ON";
+const String sOFF = "OFF";
+const String sERROR = "ERROR";
 
 // CONSTS FOR UTFT DISPLAY PAGES
 const byte HOME = 0;
 const byte WATER_PARAMS = 1;
-const byte DEBUG = 2;
-const byte DEBUG2 = 3;
-const byte WIFI_SETUP = 4;
-const byte SETTINGS = 5;
-const byte SET_TIME = 6;
+const byte SETTINGS = 2;
+const byte SET_TIME = 3;
+const byte SET_WATERLIMIT = 4;
+const byte WIFI_SETUP = 5;
+const byte DEBUG = 6;
+const byte DEBUG2 = 7;
 
 // AVAILABLE UTFT FONTS
 extern uint8_t SmallFont[];
@@ -45,12 +79,18 @@ extern uint8_t SevenSegNumFont[];
 extern uint8_t various_symbols[];
 extern uint8_t Dingbats1_XL[];
 
-// Declare which bitmap buttton we will be using
-//extern imagedatatype cat[];
-//extern imagedatatype monkey[];
-
-// SYSTEM VARS
+// TIMEZONE NAMES
+const String EST_TEXT = "Eastern Standard Time";
+const String DST_TEXT = "Daylight Savings Time (EST)";
+// TIMEZONE NAMES OFFSET
 const int EST = 18000;
+const int DST = 14400;
+// TIMEZONE VARS
+int timeZone = DST;
+String timeZoneName = DST_TEXT;
+
+// SYS VARIABLES
+bool IsTimeSet = false;
 bool IsOnFeedMode = false;
 int CurrentWaterLevel = 0;
 int CurrentDisplayPage = HOME;
@@ -58,6 +98,8 @@ int CurrentDebugPageYPos = 0;
 int feedButton, settingsButton, debugButton;
 int backButton, prevPageButton, nextPageButton;
 int pressed_button;
+bool setCurrentTime = false;
+//char daysOfTheWeek[7][12] = {"Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"};
 
 // USER CONFIG OPTIONS
 bool ShowDebugInformation = true;
@@ -71,14 +113,6 @@ byte FeedTimeInMin = 3;
 byte MinWaterLevel = 6;
 const byte MaxWaterLevel = MinWaterLevel - 2;
 
-// DECLARE ALL OBJECTS
-Timer t;
-OneWire ds(ONE_WIRE_PIN);
-NewPing sonar(TRIGGER_PIN, ECHO_PIN, MAX_DISTANCE); // NewPing setup of pins and maximum distance.
-UTFT myGLCD(SSD1289, 38, 39, 40, 41);
-UTouch  myTouch(6,5,4,3,2);
-UTFT_Buttons  myButtons(&myGLCD, &myTouch);
-
 void setup()
 {
   Serial.begin(115200);
@@ -86,17 +120,37 @@ void setup()
   loadConfigFromMemory(); 
   Serial.println("");
   Serial.println("---- Start Setup ---- ");
-  
-  //TODO: CONVERT TO RTC
-  setTime(1450512764 - EST);
-  
-  /*  
-  String output = "";
-  char[] currentTime =  (char[])getTime();
-  output = sprintf("----  Init Manual Time - %c ----", currentTime);
-  Serial.println(output);
-  */
-  Serial.println("----  Init Manual Time - " + (String)getTime() + " ----");
+
+  // start Ethernet and UDP
+  if (Ethernet.begin(mac) == 0) {Serial.println("Failed to configure Ethernet using DHCP");} 
+  Udp.begin(localPort);
+
+// SET TIME FROM RTC
+ if (! rtc.begin()) 
+  {
+    Serial.println("Couldn't find RTC");
+    setCurrentTime = true;
+  }
+  if (! rtc.isrunning()) 
+  {
+    Serial.println("RTC is NOT running!");
+    setCurrentTime = true;    
+  }
+
+  if(setCurrentTime)
+  {
+    Serial.println("RTC NOT PRESNT OR SET, SETTING TIME FROM NTP");
+    SetTimeFromNTP();
+    IsTimeSet = true;
+  }
+  else
+  {
+    RTCnow = rtc.now();
+    setTime(RTCnow.unixtime());
+    IsTimeSet = true;
+  }
+
+  Serial.println("----  RTC Time - " + (String)getTime() + " ----");
  
   pinMode(TRIGGER_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
@@ -173,13 +227,15 @@ void showDebugInfo()
   Serial.println("MinWaterLevel: " + (String)MinWaterLevel);  
   Serial.println("MaxWaterLevel: " + (String)MaxWaterLevel);  
   Serial.println("---------");
+  Serial.println("TimeZone Name: " + timeZoneName);
+  Serial.println("TimeZone OffSet: " + timeZone);
   Serial.println("Time: " + getTime() +  (!DisplayTimeAs24HRClock ? getAMPM() : ""));
   Serial.println("Date: " + getDate());
   Serial.println("IsOnFeedMode: " + (String)(IsOnFeedMode ? "YES" : "NO"));  
   Serial.println("StartWithFeedModeOn: " + (String)(StartWithFeedModeOn ? "YES" : "NO"));      
   Serial.println("Temp: " + (String)getTemp() + " - (MaxTempC: " + MaxTempThreshold + ")");
   Serial.println("CurrentWaterLevel: " + (String)CurrentWaterLevel + " - MinWL: " + MinWaterLevel);
-  Serial.println("ATO: " + (String)(digitalRead(ATO_RELAY_PIN) ? "OFF" : "ON ") + " - Should Be: " + (CurrentWaterLevel > MinWaterLevel ? "ON " : "OFF"));
+  Serial.println("ATO: " + (String)(digitalRead(ATO_RELAY_PIN) ? "OFF" : sON + " ") + " - Should Be: " + (CurrentWaterLevel > MinWaterLevel ? "ON " : "OFF"));
   Serial.println("RTPump: " + (String)(digitalRead(FEEDMODE_RELAY_PIN) ? "OFF" : "ON ") + " - Should Be: " + (String)(IsOnFeedMode ? "OFF" : "ON ")); 
   Serial.println("Skimmer: " + (String)(digitalRead(FEEDMODE_RELAY_PIN) ? "OFF" : "ON ") + " - Should Be: " + (String)(IsOnFeedMode ? "OFF" : "ON "));
   Serial.println("Heater: " + (String)(digitalRead(HEATER_RELAY_PIN) ? "OFF" : "ON ") +  " - Should Be: " + (String)(getTemp() < MaxTempThreshold ? "ON " : "OFF"));
@@ -269,6 +325,7 @@ void updateDisplay()
   myGLCD.setColor(VGA_WHITE);
   myGLCD.fillRoundRect(3, 80, 312, 85);
 
+/*
   //  START LEFT COLUMN 
   myGLCDPrint("Temp: " + _temp + (ShowTempInCelcius ? "C" : "F"), 5, 95, digitalRead(HEATER_RELAY_PIN) == HIGH);
   myGLCDPrint("Pump: " + (String)(digitalRead(FEEDMODE_RELAY_PIN) ? "OFF" : "ON "), 5, 115, digitalRead(FEEDMODE_RELAY_PIN) == HIGH);   
@@ -280,6 +337,19 @@ void updateDisplay()
   myGLCDPrint("Sg: -- ", 205, 115);  
   myGLCDPrint("Heat: " + (String)(digitalRead(HEATER_RELAY_PIN) ? "OFF" : "ON "), 174, 135, digitalRead(HEATER_RELAY_PIN) == HIGH);
   myGLCDPrint("ATO: " + (String)(digitalRead(ATO_RELAY_PIN) ? "OFF" : "ON "), 190, 155, digitalRead(ATO_RELAY_PIN) == LOW);
+*/  
+
+  //  START LEFT COLUMN 
+  myGLCDPrint("Temp: " + _temp + (ShowTempInCelcius ? "C" : "F"), 5, 95, digitalRead(HEATER_RELAY_PIN) == HIGH);
+
+  myGLCDPrint("ATO: " + (String)(digitalRead(ATO_RELAY_PIN) ? "OFF" : "ON "), 190, 95, digitalRead(ATO_RELAY_PIN) == LOW);
+  myGLCDPrint("Pump: " + (String)(digitalRead(FEEDMODE_RELAY_PIN) ? "OFF" : "ON "), 5, 115, digitalRead(FEEDMODE_RELAY_PIN) == HIGH);   
+  myGLCDPrint("Skim: " + (String)(digitalRead(FEEDMODE_RELAY_PIN) ? "OFF" : "ON "), 5, 135, digitalRead(FEEDMODE_RELAY_PIN) == HIGH);
+  myGLCDPrint("Heat: " + (String)(digitalRead(HEATER_RELAY_PIN) ? "OFF" : "ON "), 174, 135, digitalRead(HEATER_RELAY_PIN) == HIGH);  
+  
+  //  START RIGHT COLUMN 
+  
+  myGLCDPrint("WLvl: " + (String)CurrentWaterLevel + " ", 174, 115);  
 }
 
 unsigned long Watch, _micro, time = micros();
@@ -691,4 +761,56 @@ boolean TimeHasChanged()
 boolean TimeCheck(unsigned int hours, unsigned int minutes, unsigned int seconds)
 {
   return (hours == ShowHours() && minutes == ShowMinutes() && seconds == ShowSeconds());
+}
+
+void SetTimeFromNTP() {
+  
+  sendNTPpacket(timeServer); // send an NTP packet to a time server
+  
+  // wait to see if a reply is available
+  delay(1000);
+  
+  if (Udp.parsePacket()) {
+    // We've received a packet, read the data from it
+    Udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
+
+  // the timestamp starts at byte 40 of the received packet and is four bytes,
+  // or two words, long. First, extract the two words:
+
+  unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
+  unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
+  // combine the four bytes (two words) into a long integer
+  // this is NTP time (seconds since Jan 1 1900):
+  unsigned long secsSince1900 = highWord << 16 | lowWord;
+  const unsigned long seventyYears = 2208988800UL;     
+  secsSince1900 = secsSince1900 - seventyYears - 14400; // ADJUST FOR EST
+  Serial.print("Seconds since Jan 1 1900 = ");
+  Serial.println(secsSince1900);
+  setTime(secsSince1900);
+  rtc.adjust(DateTime(year(), month(), day(), hour(), minute(), second()));
+  RTCnow = rtc.now();
+  }
+} 
+
+// send an NTP request to the time server at the given address
+void sendNTPpacket(char* address) {
+  // set all bytes in the buffer to 0
+  memset(packetBuffer, 0, NTP_PACKET_SIZE);
+  // Initialize values needed to form NTP request
+  // (see URL above for details on the packets)
+  packetBuffer[0] = 0b11100011;   // LI, Version, Mode
+  packetBuffer[1] = 0;     // Stratum, or type of clock
+  packetBuffer[2] = 6;     // Polling Interval
+  packetBuffer[3] = 0xEC;  // Peer Clock Precision
+  // 8 bytes of zero for Root Delay & Root Dispersion
+  packetBuffer[12]  = 49;
+  packetBuffer[13]  = 0x4E;
+  packetBuffer[14]  = 49;
+  packetBuffer[15]  = 52;
+
+  // all NTP fields have been given values, now
+  // you can send a packet requesting a timestamp:
+  Udp.beginPacket(address, 123); //NTP requests are to port 123
+  Udp.write(packetBuffer, NTP_PACKET_SIZE);
+  Udp.endPacket();
 }
